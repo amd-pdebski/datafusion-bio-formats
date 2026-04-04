@@ -1,3 +1,4 @@
+use crate::filter_utils::can_push_down_filter;
 use crate::physical_exec::VcfExec;
 use crate::storage::get_header;
 use async_trait::async_trait;
@@ -6,7 +7,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::TableType;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::{
     ExecutionPlan, PlanProperties,
@@ -140,11 +141,28 @@ impl TableProvider for VcfTableProvider {
         // todo!()
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        let schema = self.schema();
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if can_push_down_filter(expr, &schema) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         debug!("VcfTableProvider::scan");
@@ -177,6 +195,7 @@ impl TableProvider for VcfTableProvider {
             info_fields: self.info_fields.clone(),
             format_fields: self.format_fields.clone(),
             projection: projection.cloned(),
+            filters: filters.to_vec(),
             limit,
             thread_num: self.thread_num,
             object_storage_options: self.object_storage_options.clone(),

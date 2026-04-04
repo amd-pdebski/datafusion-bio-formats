@@ -2,6 +2,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use crate::filter_utils::{evaluate_filters_against_record, vcf_end_column_value_dyn};
 use crate::storage::{VcfLocalReader, VcfRemoteReader};
 use crate::table_provider::info_to_arrow_type;
 use async_stream::__private::AsyncStream;
@@ -10,6 +11,7 @@ use datafusion::arrow::array::{Array, Float64Array, NullArray, StringArray, UInt
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_bio_format_core::{
@@ -23,7 +25,8 @@ use noodles_vcf::Header;
 use noodles_vcf::header::Infos;
 use noodles_vcf::variant::Record;
 use noodles_vcf::variant::record::info::field::{Value, value::Array as ValueArray};
-use noodles_vcf::variant::record::{AlternateBases, Filters, Ids, ReferenceBases};
+use noodles_vcf::variant::record::{AlternateBases, Filters, Ids};
+use std::future::Future;
 use std::str;
 
 pub fn build_record_batch(
@@ -138,7 +141,14 @@ fn load_infos(
                         builder.append_null()?;
                     }
                 }
-                _ => panic!("Unsupported value type"),
+                other => {
+                    log::warn!(
+                        "Unsupported INFO value type {:?} for tag {}; using NULL",
+                        other,
+                        name
+                    );
+                    builder.append_null()?;
+                }
             },
 
             _ => {
@@ -154,26 +164,7 @@ fn load_infos(
 }
 
 fn get_variant_end(record: &dyn Record, header: &Header) -> u32 {
-    let ref_len = record.reference_bases().len();
-    let alt_len = record.alternate_bases().len();
-    //check if all are single base ACTG
-    if ref_len == 1
-        && alt_len == 1
-        && record
-            .reference_bases()
-            .iter()
-            .map(|c| c.unwrap())
-            .all(|c| c == b'A' || c == b'C' || c == b'G' || c == b'T')
-        && record
-            .alternate_bases()
-            .iter()
-            .map(|c| c.unwrap())
-            .all(|c| c.eq("A") || c.eq("C") || c.eq("G") || c.eq("T"))
-    {
-        record.variant_start().unwrap().unwrap().get() as u32
-    } else {
-        record.variant_end(header).unwrap().get() as u32
-    }
+    vcf_end_column_value_dyn(record, header)
 }
 
 async fn get_local_vcf(
@@ -184,6 +175,8 @@ async fn get_local_vcf(
     info_fields: Option<Vec<String>>,
     projection: Option<Vec<usize>>,
     object_storage_options: Option<ObjectStorageOptions>,
+    scan_filters: Vec<Expr>,
+    limit: Option<usize>,
 ) -> datafusion::error::Result<impl futures::Stream<Item = datafusion::error::Result<RecordBatch>>>
 {
     let mut chroms: Vec<String> = Vec::with_capacity(batch_size);
@@ -216,9 +209,20 @@ async fn get_local_vcf(
     let stream = try_stream! {
 
         let mut records = reader.read_records();
+        let mut accepted_total: usize = 0;
         // let iter_start_time = Instant::now();
         while let Some(result) = records.next().await {
+            if let Some(lim) = limit {
+                if accepted_total >= lim {
+                    break;
+                }
+            }
             let record = result?;  // propagate errors if any
+            if !scan_filters.is_empty()
+                && !evaluate_filters_against_record(&record, &header, &scan_filters)
+            {
+                continue;
+            }
             chroms.push(record.reference_sequence_name().to_string());
             poss.push(record.variant_start().unwrap()?.get() as u32);
             pose.push(get_variant_end(&record, &header));
@@ -229,6 +233,7 @@ async fn get_local_vcf(
             filters.push(record.filters().iter(&header).map(|v| v.unwrap_or(".").to_string()).collect::<Vec<String>>().join(";"));
             load_infos(Box::new(record), &header, &mut info_builders)?;
             record_num += 1;
+            accepted_total += 1;
             // Once the batch size is reached, build and yield a record batch.
             if record_num % batch_size == 0 {
                 debug!("Record number: {}", record_num);
@@ -290,6 +295,8 @@ async fn get_remote_vcf_stream(
     info_fields: Option<Vec<String>>,
     projection: Option<Vec<usize>>,
     object_storage_options: Option<ObjectStorageOptions>,
+    scan_filters: Vec<Expr>,
+    limit: Option<usize>,
 ) -> datafusion::error::Result<
     AsyncStream<datafusion::error::Result<RecordBatch>, impl Future<Output = ()> + Sized>,
 > {
@@ -321,8 +328,19 @@ async fn get_remote_vcf_stream(
         // Process records one by one.
 
         let mut records = reader.read_records().await;
+        let mut accepted_total: usize = 0;
         while let Some(result) = records.next().await {
+            if let Some(lim) = limit {
+                if accepted_total >= lim {
+                    break;
+                }
+            }
             let record = result?;  // propagate errors if any
+            if !scan_filters.is_empty()
+                && !evaluate_filters_against_record(&record, &header, &scan_filters)
+            {
+                continue;
+            }
             chroms.push(record.reference_sequence_name().to_string());
             poss.push(record.variant_start().unwrap()?.get() as u32);
             pose.push(get_variant_end(&record, &header));
@@ -333,6 +351,7 @@ async fn get_remote_vcf_stream(
             filters.push(record.filters().iter(&header).map(|v| v.unwrap_or(".").to_string()).collect::<Vec<String>>().join(";"));
             load_infos(Box::new(record), &header, &mut info_builders)?;
             record_num += 1;
+            accepted_total += 1;
             // Once the batch size is reached, build and yield a record batch.
             if record_num % batch_size == 0 {
                 debug!("Record number: {}", record_num);
@@ -410,6 +429,8 @@ async fn get_stream(
     info_fields: Option<Vec<String>>,
     projection: Option<Vec<usize>>,
     object_storage_options: Option<ObjectStorageOptions>,
+    scan_filters: Vec<Expr>,
+    limit: Option<usize>,
 ) -> datafusion::error::Result<SendableRecordBatchStream> {
     // Open the BGZF-indexed VCF using IndexedReader.
 
@@ -427,6 +448,8 @@ async fn get_stream(
                 info_fields,
                 projection,
                 object_storage_options,
+                scan_filters.clone(),
+                limit,
             )
             .await?;
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, stream)))
@@ -439,6 +462,8 @@ async fn get_stream(
                 info_fields,
                 projection,
                 object_storage_options,
+                scan_filters.clone(),
+                limit,
             )
             .await?;
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, stream)))
@@ -455,6 +480,7 @@ pub struct VcfExec {
     pub(crate) info_fields: Option<Vec<String>>,
     pub(crate) format_fields: Option<Vec<String>>,
     pub(crate) cache: PlanProperties,
+    pub(crate) filters: Vec<Expr>,
     pub(crate) limit: Option<usize>,
     pub(crate) thread_num: Option<usize>,
     pub(crate) object_storage_options: Option<ObjectStorageOptions>,
@@ -513,6 +539,8 @@ impl ExecutionPlan for VcfExec {
             self.info_fields.clone(),
             self.projection.clone(),
             self.object_storage_options.clone(),
+            self.filters.clone(),
+            self.limit,
         );
         let stream = futures::stream::once(fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
